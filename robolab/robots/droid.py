@@ -34,7 +34,117 @@ from robolab.core.environments.scene_fixture import FRANKA_TABLE_FIXTURE
 #   - examples/run_abs_ik_demo.py (converts eef_frame targets → base_link IK actions)
 # Kept here so all code agrees on what eef_frame is.
 EEF_OFFSET_POS: tuple[float, float, float] = (0.0, 0.0, 0.0)
-EEF_OFFSET_ROT: tuple[float, float, float, float] = (0.5, -0.5, 0.5, -0.5)
+EEF_OFFSET_ROT: tuple[float, float, float, float] = (-0.5, 0.5, -0.5, 0.5)
+
+# The flattened DROID USD omits inertials on the Robotiq links because PhysX
+# infers them from collision geometry. MJWarp compiles through MuJoCo, which
+# requires explicit positive mass and inertia for every moving body. Values
+# below come from the Robotiq 2F-85 MJCF shipped with Cosmos Framework; the
+# names are mapped to the equivalent links in this USD articulation.
+_ROBOTIQ_INERTIALS = {
+    "base_link": (
+        0.777441,
+        (7.77116e-05, 8.42713e-05, 0.0311656),
+        (0.000260285, 0.000225381, 0.000152708),
+        (0.704758, -0.00373684, -0.00570287, 0.709415),
+    ),
+    "left_outer_knuckle": (
+        0.00899563,
+        (-0.0175297, 0.00165308, -0.00469625),
+        (1.72352e-06, 1.60906e-06, 3.22006e-07),
+        (-0.469642, 0.469642, -0.528617, 0.528617),
+    ),
+    "left_outer_finger": (
+        0.0140974,
+        (0.00367747, 0.01986, 0.0055),
+        (4.16206e-06, 3.52216e-06, 8.88131e-07),
+        (0.701447, -0.701447, 0.0892884, -0.0892884),
+    ),
+    "left_inner_finger": (
+        0.0125222,
+        (-0.00852976, -0.0014822, -0.00910001),
+        (2.67415e-06, 2.4559e-06, 6.02031e-07),
+        (0.359439, 0.359439, 0.608937, 0.608937),
+    ),
+    "left_inner_knuckle": (
+        0.0221642,
+        (-0.0183, -0.0205732, 0.01205),
+        (8.96853e-06, 6.71733e-06, 2.63931e-06),
+        (0.660941, 0.660941, -0.251309, -0.251309),
+    ),
+}
+for _right_name, _left_name in (
+    ("right_outer_knuckle", "left_outer_knuckle"),
+    ("right_outer_finger", "left_outer_finger"),
+    ("right_inner_finger", "left_inner_finger"),
+    ("right_inner_knuckle", "left_inner_knuckle"),
+):
+    _ROBOTIQ_INERTIALS[_right_name] = _ROBOTIQ_INERTIALS[_left_name]
+
+
+def spawn_droid_from_usd(prim_path, cfg, translation=None, orientation=None, **kwargs):
+    """Spawn the DROID USD and add the Robotiq inertials missing from the file."""
+    from isaaclab.sim.spawners.from_files import spawn_from_usd
+    from isaaclab.utils import has_kit
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    root_prim = spawn_from_usd(prim_path, cfg, translation, orientation, **kwargs)
+    stage = sim_utils.get_current_stage()
+    gripper_path_token = "/Gripper/Robotiq_2F_85/"
+
+    if not has_kit():
+        # The flattened asset puts CollisionAPI on instanceable Xform wrappers.
+        # PhysX accepts that layout, but Newton's USD importer only cooks
+        # UsdGeomGPrim colliders. De-instance the gripper and move the APIs to
+        # the referenced Mesh prims while preserving their inherited transforms.
+        from isaaclab.sim.utils.prims import make_uninstanceable
+
+        gripper_root_path = f"{prim_path}/Gripper/Robotiq_2F_85"
+        make_uninstanceable(gripper_root_path, stage=stage)
+        collision_wrappers = [
+            prim
+            for prim in stage.Traverse()
+            if gripper_path_token in str(prim.GetPath())
+            and prim.HasAPI(UsdPhysics.CollisionAPI)
+            and not prim.IsA(UsdGeom.Gprim)
+        ]
+        for wrapper in collision_wrappers:
+            collision_enabled = UsdPhysics.CollisionAPI(wrapper).GetCollisionEnabledAttr().Get()
+            wrapper_mesh_api = UsdPhysics.MeshCollisionAPI(wrapper)
+            approximation = wrapper_mesh_api.GetApproximationAttr().Get() if wrapper_mesh_api else None
+            for descendant in Usd.PrimRange(wrapper):
+                if descendant == wrapper or not descendant.IsA(UsdGeom.Mesh):
+                    continue
+                collision_api = UsdPhysics.CollisionAPI(descendant)
+                if not collision_api:
+                    collision_api = UsdPhysics.CollisionAPI.Apply(descendant)
+                if collision_enabled is not None:
+                    collision_api.CreateCollisionEnabledAttr(collision_enabled)
+                mesh_api = UsdPhysics.MeshCollisionAPI(descendant)
+                if not mesh_api:
+                    mesh_api = UsdPhysics.MeshCollisionAPI.Apply(descendant)
+                mesh_api.CreateApproximationAttr(approximation or "convexHull")
+            if wrapper_mesh_api:
+                wrapper.RemoveAPI(UsdPhysics.MeshCollisionAPI)
+            wrapper.RemoveAPI(UsdPhysics.CollisionAPI)
+
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if gripper_path_token not in path:
+            continue
+        link_name = path.rsplit("/", 1)[-1]
+        inertial = _ROBOTIQ_INERTIALS.get(link_name)
+        if inertial is None:
+            continue
+        mass, center_of_mass, diagonal_inertia, principal_axes = inertial
+        mass_api = UsdPhysics.MassAPI(prim)
+        if not mass_api:
+            mass_api = UsdPhysics.MassAPI.Apply(prim)
+        mass_api.CreateMassAttr(mass)
+        mass_api.CreateCenterOfMassAttr(Gf.Vec3f(*center_of_mass))
+        mass_api.CreateDiagonalInertiaAttr(Gf.Vec3f(*diagonal_inertia))
+        mass_api.CreatePrincipalAxesAttr(Gf.Quatf(principal_axes[0], Gf.Vec3f(*principal_axes[1:])))
+    return root_prim
 
 _frame_marker_cfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/TF")
 _frame_marker_cfg.markers["frame"].scale = (0.05, 0.05, 0.05)
@@ -55,7 +165,7 @@ _WRIST_CAM = TiledCameraCfg(
         vertical_aperture=3.024,
     ),
     offset=TiledCameraCfg.OffsetCfg(
-        pos=(0.011, -0.031, -0.074), rot=(-0.420, 0.570, 0.576, -0.409), convention="opengl"
+        pos=(0.011, -0.031, -0.074), rot=(0.570, 0.576, -0.409, -0.420), convention="opengl"
     ),
 )
 
@@ -67,6 +177,7 @@ class DroidCfg:
     robot = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/robot",
         spawn=sim_utils.UsdFileCfg(
+            func=spawn_droid_from_usd,
             usd_path= os.path.join(ROBOTS_DIR, "franka_robotiq_2f_85_flattened.usd"),
             activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -81,7 +192,7 @@ class DroidCfg:
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0, 0, 0),
-            rot=(1, 0, 0, 0),
+            rot=(0, 0, 0, 1),
             joint_pos={
                 "panda_joint1": 0.0,
                 "panda_joint2": -1 / 5 * np.pi,
@@ -260,7 +371,7 @@ def ee_pos(
 def ee_quat(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ):
-    """Returns the end effector orientation as quaternion (w, x, y, z) in the robot-root frame."""
+    """Returns the end effector orientation as quaternion (x, y, z, w) in the robot-root frame."""
     robot = env.scene[asset_cfg.name]
     # Get the body index for the end effector link
     ee_body_name = "base_link"  # Robotiq gripper base link
@@ -288,7 +399,7 @@ def eef_pos(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("
 
 
 def eef_quat(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("frames")):
-    """Returns the eef_frame orientation as quaternion (w, x, y, z) in the robot-root frame."""
+    """Returns the eef_frame orientation as quaternion (x, y, z, w) in the robot-root frame."""
     frames = env.scene[asset_cfg.name]
     robot = env.scene["robot"]
     idx = frames.data.target_frame_names.index("eef_frame")
@@ -371,7 +482,7 @@ class DroidIKActionCfg:
     Note:
         if self.cfg.command_type == "position", action_dim = 3, (x, y, z)
         if self.cfg.command_type == "pose" and self.cfg.use_relative_mode, action_dim = 6, (dx, dy, dz, droll, dpitch, dyaw)
-        if self.cfg.command_type == "pose" and not self.cfg.use_relative_mode, action_dim = 7, (x, y, z, qw, qx, qy, qz)
+        if self.cfg.command_type == "pose" and not self.cfg.use_relative_mode, action_dim = 7, (x, y, z, qx, qy, qz, qw)
     """
     arm_action = DifferentialInverseKinematicsActionCfg(
         asset_name="robot",
@@ -402,7 +513,7 @@ class DroidRelIKActionCfg:
     Note:
         if self.cfg.command_type == "position", action_dim = 3, (x, y, z)
         if self.cfg.command_type == "pose" and self.cfg.use_relative_mode, action_dim = 6, (dx, dy, dz, droll, dpitch, dyaw)
-        if self.cfg.command_type == "pose" and not self.cfg.use_relative_mode, action_dim = 7, (x, y, z, qw, qx, qy, qz)
+        if self.cfg.command_type == "pose" and not self.cfg.use_relative_mode, action_dim = 7, (x, y, z, qx, qy, qz, qw)
     """
     arm_action = DifferentialInverseKinematicsActionCfg(
         asset_name="robot",
@@ -412,7 +523,7 @@ class DroidRelIKActionCfg:
         scale=0.5,
         body_offset=DifferentialInverseKinematicsActionCfg.OffsetCfg(
             pos=[0.0, 0.0, 0.0],
-            # rot=(0.5, -0.5, 0.5, -0.5),  # Match eef_frame: rotates base_link to the EE control frame.
+            # rot=(-0.5, 0.5, -0.5, 0.5),  # Match eef_frame: rotates base_link to the EE control frame.
         ),
         # Robotiq 2F-85 max height base flange -> fingertip is 162.8mm (per Robotiq spec).
         # Uncomment to control the fingertip plane instead of the base flange.

@@ -209,6 +209,8 @@ def run_evaluation(
             policy=policy,
             renderer=args.renderer,
             rendering_mode=args.rendering_type,
+            physics_backend=args.physics_backend,
+            launcher_args=args,
         )
 
         if robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING and getattr(env_cfg, "subtasks", None) is None:

@@ -12,11 +12,12 @@ import json
 import logging
 import os
 
-import carb
 import gymnasium as gym
+import isaaclab.sim as sim_utils
 import numpy as np
-import omni.usd
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg, ManagerBasedRLEnv
+from isaaclab.sensors import CameraCfg
+from isaaclab.utils import has_kit
 
 import robolab.constants
 from robolab.constants import get_output_dir
@@ -31,6 +32,73 @@ logger = logging.getLogger(__name__)
 # carb value. "realtime" is IsaacLab's default; we leave it unset so behavior
 # is unchanged and only override the carb setting for the path tracer.
 _RENDERER_TO_RTX_MODE = {"realtime": "RaytracedLighting", "pathtracing": "PathTracing"}
+
+
+def _create_new_stage() -> None:
+    """Create a stage through Kit when active, otherwise through pure USD."""
+    if has_kit():
+        import carb
+        import omni.usd
+
+        omni.usd.get_context().new_stage()
+        carb.settings.get_settings().set_bool("/isaaclab/render/rtx_sensors", False)
+    else:
+        sim_utils.create_new_stage()
+
+
+def _configure_newton_backend(env_cfg: ManagerBasedEnvCfg) -> None:
+    """Select Newton/MJWarp physics and the kit-less Newton camera renderer."""
+    from isaaclab_newton.physics import (
+        MJWarpSolverCfg,
+        NewtonCfg,
+        NewtonCollisionPipelineCfg,
+        NewtonShapeCfg,
+    )
+    from isaaclab_newton.renderers import NewtonWarpRendererCfg
+
+    # Match Isaac Lab's current manipulation-stack Newton preset rather than
+    # carrying RoboLab's PhysX tuning into an unrelated solver.
+    env_cfg.sim.physics = NewtonCfg(
+        solver_cfg=MJWarpSolverCfg(
+            solver="newton",
+            integrator="implicitfast",
+            # RoboLab's articulated Robotiq collision meshes peaked at 529
+            # scalar constraints in the one-env smoke rollout.
+            njmax=640,
+            nconmax=200,
+            impratio=10.0,
+            cone="elliptic",
+            update_data_interval=2,
+            iterations=100,
+            ls_iterations=15,
+            ls_parallel=False,
+            use_mujoco_contacts=False,
+            ccd_iterations=35,
+        ),
+        collision_cfg=NewtonCollisionPipelineCfg(),
+        default_shape_cfg=NewtonShapeCfg(),
+        num_substeps=2,
+        debug_mode=False,
+    )
+    env_cfg.sim.use_fabric = False
+
+    renderer_cfg = NewtonWarpRendererCfg(
+        enable_textures=True,
+        enable_shadows=False,
+        enable_ambient_lighting=True,
+    )
+    for value in vars(env_cfg.scene).values():
+        if isinstance(value, CameraCfg):
+            value.renderer_cfg = renderer_cfg.copy()
+
+
+def _make_env(scene: str, env_cfg: ManagerBasedEnvCfg, physics_backend: str, launcher_args):
+    if physics_backend == "newton":
+        from isaaclab_tasks.utils import launch_simulation
+
+        with launch_simulation(env_cfg, launcher_args):
+            return gym.make(scene, cfg=env_cfg).unwrapped
+    return gym.make(scene, cfg=env_cfg).unwrapped
 
 
 def _apply_render_settings(env_cfg: ManagerBasedEnvCfg, renderer: str, rendering_mode: str | None) -> None:
@@ -86,6 +154,8 @@ def create_env(scene: str | ManagerBasedEnvCfg,
                policy=None,
                renderer="realtime",
                rendering_mode=None,
+               physics_backend="physx",
+               launcher_args=None,
     ):
     """
     Creates and initializes a gym environment for the specified scene. Supported types: str, ManagerBasedEnvCfg.
@@ -137,6 +207,10 @@ def create_env(scene: str | ManagerBasedEnvCfg,
             "pathtracing" (PathTracing). Default preserves IsaacLab behavior.
         rendering_mode: Realtime quality preset ("performance"/"balanced"/"quality")
             or None to leave IsaacLab's default ("balanced").
+        physics_backend: ``"physx"`` for the existing Isaac Sim path or
+            ``"newton"`` for kit-less Newton/MJWarp with Newton Warp cameras.
+        launcher_args: Parsed AppLauncher-compatible arguments. Used by the
+            kit-less launcher to select optional Newton/Viser visualization.
 
     Raises:
         ValueError: If the scene type is not supported or environment creation fails
@@ -146,11 +220,12 @@ def create_env(scene: str | ManagerBasedEnvCfg,
     """
     env = None
 
+    if physics_backend not in ("physx", "newton"):
+        raise ValueError(f"Unknown physics backend '{physics_backend}'")
+
     if isinstance(scene, str):
         # create a new stage
-        omni.usd.get_context().new_stage()
-        # reset the rtx sensors carb setting to False
-        carb.settings.get_settings().set_bool("/isaaclab/render/rtx_sensors", False)
+        _create_new_stage()
 
         try:
             # Initialize the env for current scene
@@ -168,8 +243,11 @@ def create_env(scene: str | ManagerBasedEnvCfg,
             env_cfg._instruction_variants = env_cfg.instruction
             env_cfg.instruction = resolve_instruction(env_cfg.instruction, instruction_type)
 
-            # Configure the RTX renderer before the sim context is created.
-            _apply_render_settings(env_cfg, renderer, rendering_mode)
+            if physics_backend == "newton":
+                _configure_newton_backend(env_cfg)
+            else:
+                # Configure the RTX renderer before the sim context is created.
+                _apply_render_settings(env_cfg, renderer, rendering_mode)
 
             # Merge events into the environment configuration if provided
             # This preserves existing events (like reset_scene_to_default) while adding new ones
@@ -179,7 +257,7 @@ def create_env(scene: str | ManagerBasedEnvCfg,
                     print(f"Merged events into environment configuration: {env_cfg.events}")
 
             # Create new environment
-            env = gym.make(scene, cfg=env_cfg).unwrapped
+            env = _make_env(scene, env_cfg, physics_backend, launcher_args)
         except Exception:
             # Best-effort cleanup of partially-constructed env; always re-raise
             # so the caller sees the original traceback (don't wrap in
@@ -193,16 +271,17 @@ def create_env(scene: str | ManagerBasedEnvCfg,
 
     elif isinstance(scene, ManagerBasedEnvCfg):
         # create a new stage
-        omni.usd.get_context().new_stage()
-        # reset the rtx sensors carb setting to False
-        carb.settings.get_settings().set_bool("/isaaclab/render/rtx_sensors", False)
+        _create_new_stage()
         env_cfg = scene
 
         env_cfg._instruction_variants = env_cfg.instruction
         env_cfg.instruction = resolve_instruction(env_cfg.instruction, instruction_type)
 
-        # Configure the RTX renderer before the sim context is created.
-        _apply_render_settings(env_cfg, renderer, rendering_mode)
+        if physics_backend == "newton":
+            _configure_newton_backend(env_cfg)
+        else:
+            # Configure the RTX renderer before the sim context is created.
+            _apply_render_settings(env_cfg, renderer, rendering_mode)
 
         # Merge events into the environment configuration if provided
         # This preserves existing events (like reset_scene_to_default) while adding new ones
@@ -211,7 +290,13 @@ def create_env(scene: str | ManagerBasedEnvCfg,
             if robolab.constants.VERBOSE:
                 print(f"Merged events into environment configuration: {env_cfg.events}")
 
-        env = RobolabEnv(env_cfg)
+        if physics_backend == "newton":
+            from isaaclab_tasks.utils import launch_simulation
+
+            with launch_simulation(env_cfg, launcher_args):
+                env = RobolabEnv(env_cfg)
+        else:
+            env = RobolabEnv(env_cfg)
     else:
         raise ValueError(f"Unsupported scene type: {type(scene)}")
 
@@ -221,7 +306,8 @@ def create_env(scene: str | ManagerBasedEnvCfg,
     check_scene_valid(env)
 
     # disable control on stop
-    env.sim._app_control_on_stop_handle = None  # type: ignore
+    if hasattr(env.sim, "_app_control_on_stop_handle"):
+        env.sim._app_control_on_stop_handle = None  # type: ignore
 
     env.output_dir = get_output_dir()
     os.makedirs(env.output_dir, exist_ok=True)

@@ -4,6 +4,16 @@
 import torch
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 
+try:
+    # Isaac Lab 3's ContactSensor is a backend factory; the concrete PhysX and
+    # Newton sensors inherit BaseContactSensor rather than the factory class.
+    from isaaclab.sensors.contact_sensor import BaseContactSensor
+
+    CONTACT_SENSOR_TYPES = (ContactSensor, BaseContactSensor)
+except ImportError:
+    # Isaac Lab 2.x exposes concrete sensors as ContactSensor instances.
+    CONTACT_SENSOR_TYPES = (ContactSensor,)
+
 
 def create_contact_sensor_cfg(entity_1, entity_2, update_period=0.0, history_length=6, debug_vis=False):
         return ContactSensorCfg(
@@ -140,7 +150,7 @@ def get_contact_sensors(scene):
     """
     contact_sensors = {
         name: sensor for name, sensor in scene.sensors.items()
-        if isinstance(sensor, ContactSensor)
+        if isinstance(sensor, CONTACT_SENSOR_TYPES)
     }
     return contact_sensors
 

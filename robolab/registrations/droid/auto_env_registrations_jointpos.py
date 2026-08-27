@@ -28,7 +28,8 @@ The columns are:
 """
 def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensity=None, task=None, cameras=None,
                              randomize_background=False, background_seed=None, viewport_camera=None,
-                             lazy_sensor_update=True, object_state_obs=False):
+                             lazy_sensor_update=True, object_state_obs=False,
+                             include_viewport_camera=True):
     """Automatically discover and register tasks.
 
     Args:
@@ -48,6 +49,8 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
               ``randomize_background`` is False.
         viewport_camera: Camera config class for the video-recording viewport.
               Defaults to ``EgocentricMirroredCameraCfg``.
+        include_viewport_camera: Spawn and observe the video-only viewport camera.
+              Disable this when ``video_mode`` does not save viewport video.
         lazy_sensor_update: Passed to the scene config. Set False when sensor
               annotators beyond rgb (e.g. depth) must render eagerly in headless
               mode. Default True (IsaacLab default).
@@ -74,21 +77,25 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
 
     if cameras is None:
         cameras = WRIST_LEFT
-    if viewport_camera is None:
+    if include_viewport_camera and viewport_camera is None:
         viewport_camera = EgocentricMirroredCameraCfg
 
     ImageObsCfg = generate_image_obs_from_cameras(cameras)
-    ViewportCameraCfg = generate_image_obs_from_cameras([viewport_camera])
-
-    ObservationCfg = generate_obs_cfg({
+    observation_groups = {
         "image_obs": ImageObsCfg(),
         "proprio_obs": ProprioceptionObservationCfg(),
-        "viewport_cam": ViewportCameraCfg()})
+    }
+    if include_viewport_camera:
+        ViewportCameraCfg = generate_image_obs_from_cameras([viewport_camera])
+        observation_groups["viewport_cam"] = ViewportCameraCfg()
+    ObservationCfg = generate_obs_cfg(observation_groups)
 
     # WristCameraCfg is robot-mounted (wrist_cam is already attached via DroidCfg).
     # Including it as a scene mixin puts wrist_cam before robot in dataclass field
     # order, causing the camera to spawn before its parent prim exists.
     scene_cameras = [c for c in cameras if c is not WristCameraCfg]
+    if include_viewport_camera:
+        scene_cameras.append(viewport_camera)
 
     if randomize_background:
         from robolab.variations.backgrounds import find_background_files, generate_background_config
@@ -120,7 +127,7 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         observations_cfg=ObservationCfg(),
         actions_cfg=DroidJointPositionActionCfg(),
         robot_cfg=DroidCfg,
-        camera_cfg=[*scene_cameras, viewport_camera],
+        camera_cfg=scene_cameras,
         lighting_cfg=SphereLightCfg,
         background_cfg=background_cfg,
         contact_gripper=contact_gripper,

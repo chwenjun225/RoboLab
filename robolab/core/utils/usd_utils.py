@@ -10,8 +10,12 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 try:
     import isaacsim.core.utils.stage as stage_utils  # type: ignore
-except ImportError:  # pragma: no cover -- running outside Isaac-Sim
-    stage_utils = None  # noqa: N816 – keep original style for clarity
+except ImportError:
+    try:
+        # Isaac Lab 3 replacement for the deprecated Isaac Sim 5 utility.
+        import isaaclab.sim.utils.stage as stage_utils  # type: ignore
+    except ImportError:  # pragma: no cover -- running outside Isaac-Sim/Lab
+        stage_utils = None  # noqa: N816 – keep original style for clarity
 
 import copy
 import os
@@ -331,7 +335,14 @@ def _get_usd_objects_info_cached(usd_path: str) -> tuple:
             rot = norm_mat.ExtractRotation().GetQuat()
         else:
             rot = Gf.Quatd(1, 0, 0, 0)
-        rot_quat = (rot.GetReal(), rot.GetImaginary()[0], rot.GetImaginary()[1], rot.GetImaginary()[2])
+        # Gf stores quaternions scalar-first, while Isaac Lab 3 configuration
+        # boundaries (including RigidObjectCfg.InitialStateCfg) use XYZW.
+        rot_quat = (
+            rot.GetImaginary()[0],
+            rot.GetImaginary()[1],
+            rot.GetImaginary()[2],
+            rot.GetReal(),
+        )
 
         object_info = {
             'name': name,

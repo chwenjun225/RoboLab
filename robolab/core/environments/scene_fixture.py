@@ -31,7 +31,13 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.sim.utils import clone
 from isaaclab.utils import configclass
-from isaacsim.core.utils.stage import get_current_stage
+try:
+    # Isaac Sim 5.x legacy utility extension.
+    from isaacsim.core.utils.stage import get_current_stage
+except ImportError:
+    # Isaac Lab 3 exposes the stage utility directly and does not enable the
+    # deprecated Isaac Sim 5 extension by default.
+    from isaaclab.sim.utils.stage import get_current_stage
 from pxr import Usd, UsdGeom
 
 from robolab.constants import ASSET_DIR
@@ -46,12 +52,12 @@ class TableFixtureCfg:
     The pose is expressed in the frame selected by ``frame``: ``"origin"`` for
     the env origin, ``"robot"`` for the robot root's init pose (the fixture
     then follows e.g. a ground-rebased root). Translation in meters, rotation
-    as a ``(w, x, y, z)`` quaternion.
+    as an Isaac Lab ``(x, y, z, w)`` quaternion.
     """
 
     usd_path: str
     pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    rot: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    rot: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     frame: Literal["origin", "robot"] = "origin"
 
 
@@ -59,27 +65,27 @@ FRANKA_TABLE_FIXTURE = TableFixtureCfg(
     usd_path=os.path.join(ASSET_DIR, "fixtures", "franka_table.usd"),
     pos=(-0.087, 0.0, 0.0),
     # 180 degrees about +Z, matching the pose authored in every task scene.
-    rot=(6.123233995736766e-17, 0.0, 0.0, 1.0),
+    rot=(0.0, 0.0, 1.0, 6.123233995736766e-17),
 )
 
 
 def _quat_mul(
     q1: tuple[float, float, float, float], q2: tuple[float, float, float, float]
 ) -> tuple[float, float, float, float]:
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
     return (
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
         w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
         w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
         w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
     )
 
 
 def _quat_rotate(q: tuple[float, float, float, float], v: tuple[float, float, float]) -> tuple[float, float, float]:
-    w, x, y, z = q
-    qv = _quat_mul(_quat_mul(q, (0.0, *v)), (w, -x, -y, -z))
-    return qv[1:]
+    x, y, z, w = q
+    qv = _quat_mul(_quat_mul(q, (*v, 0.0)), (-x, -y, -z, w))
+    return qv[:3]
 
 
 def table_fixture_asset(fixture: TableFixtureCfg | None, robot_cfg: type) -> AssetBaseCfg | None:

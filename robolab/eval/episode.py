@@ -145,16 +145,22 @@ def run_episode(
         except Exception:
             logger.exception("Failed to initialize the GT-state exporter")
 
-    import omni.kit.app
-    import omni.timeline
-    timeline = omni.timeline.get_timeline_interface()
-    kit_app = omni.kit.app.get_app()
+    from isaaclab.utils import has_kit
+
+    timeline = None
+    kit_app = None
+    if has_kit():
+        import omni.kit.app
+        import omni.timeline
+
+        timeline = omni.timeline.get_timeline_interface()
+        kit_app = omni.kit.app.get_app()
 
     actual_steps = 0
     try:
         for step in tqdm(range(max_steps)):
 
-            while not timeline.is_playing():
+            while timeline is not None and not timeline.is_playing():
                 kit_app.update()
 
             # Attach per-env ground-truth state so clients that want privileged
