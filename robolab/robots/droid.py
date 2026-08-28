@@ -23,7 +23,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sensors import TiledCameraCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import FrameTransformerCfg, OffsetCfg
-from isaaclab.utils import configclass, noise
+from isaaclab.utils import configclass, has_kit, noise
 from isaaclab.utils.math import subtract_frame_transforms
 
 from robolab.constants import ROBOTS_DIR
@@ -82,10 +82,46 @@ for _right_name, _left_name in (
     _ROBOTIQ_INERTIALS[_right_name] = _ROBOTIQ_INERTIALS[_left_name]
 
 
+_ROBOTIQ_ACTUATORS = {
+    "gripper": ImplicitActuatorCfg(
+        joint_names_expr=["finger_joint"],
+        stiffness=None,
+        damping=None,
+        velocity_limit=5.0,
+    ),
+}
+if not has_kit():
+    _ROBOTIQ_ACTUATORS = {
+        "gripper": ImplicitActuatorCfg(
+            joint_names_expr=["finger_joint"],
+            stiffness=None,
+            damping=None,
+            armature=0.001,
+            effort_limit_sim=16.5,
+        ),
+        # Newton imports PhysX mimic joints as MJCF equality constraints. Give
+        # the five passive coordinates a small reflected inertia and damping
+        # so their tiny link inertias cannot create unbounded joint velocities
+        # while the equality solver converges.
+        "gripper_followers": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "left_inner_finger_joint",
+                "left_inner_finger_knuckle_joint",
+                "right_outer_knuckle_joint",
+                "right_inner_finger_joint",
+                "right_inner_finger_knuckle_joint",
+            ],
+            stiffness=0.0,
+            damping=0.001,
+            armature=0.001,
+            effort_limit_sim=16.5,
+        ),
+    }
+
+
 def spawn_droid_from_usd(prim_path, cfg, translation=None, orientation=None, **kwargs):
     """Spawn the DROID USD and add the Robotiq inertials missing from the file."""
     from isaaclab.sim.spawners.from_files import spawn_from_usd
-    from isaaclab.utils import has_kit
     from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
     root_prim = spawn_from_usd(prim_path, cfg, translation, orientation, **kwargs)
@@ -227,15 +263,7 @@ class DroidCfg:
                 stiffness=400.0,
                 damping=80.0,
             ),
-            "gripper": ImplicitActuatorCfg(
-                joint_names_expr=["finger_joint"],
-                stiffness=None,
-                damping=None,
-                # effort_limit=150.0,
-                velocity_limit=5.0, #2.175,
-                # stiffness=1000.0,
-                # damping=40.0,
-            ),
+            **_ROBOTIQ_ACTUATORS,
         },
     )
 
